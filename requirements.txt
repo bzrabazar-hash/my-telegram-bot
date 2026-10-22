@@ -1,0 +1,7 @@
+python-telegram-bot
+Pillow
+pytesseract
+pypdf
+pdf2docx
+gTTS
+qrcode
