@@ -1,5 +1,0 @@
-python-telegram-bot>=21,<22
-pypdf
-Pillow
-gTTS
-qrcode[pil]
