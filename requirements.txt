@@ -1,7 +1,5 @@
-python-telegram-bot
-Pillow
-pytesseract
+python-telegram-bot>=21,<22
 pypdf
-pdf2docx
+Pillow
 gTTS
-qrcode
+qrcode[pil]
