@@ -217,5 +217,6 @@ _a("pay_rejected_manual", "❌ لم نتمكن من التأكد من التحو
 _a("pay_revoked", "ℹ️ تم إلغاء تفعيل يومك المفتوح من قِبل المشرف.", "ℹ️ Your day pass was cancelled by the admin.", "ℹ️ Votre pass a été annulé par l'administrateur.")
 _a("why_txn", "رقم العملية غير ظاهر في الصورة", "the transaction number is not visible in the image", "le numéro d'opération n'apparaît pas sur l'image")
 _a("why_amount", "المبلغ غير ظاهر أو غير مطابق", "the amount is missing or doesn't match", "le montant est absent ou différent")
+_a("why_old", "الإشعار قديم أو تاريخه غير صحيح", "the receipt is too old or its date is invalid", "le reçu est trop ancien ou sa date est invalide")
 _a("why_recipient", "حساب المستلم غير مطابق", "the recipient doesn't match", "le destinataire ne correspond pas")
 _a("why_ocr", "تعذرت قراءة الصورة", "the image could not be read", "l'image n'a pas pu être lue")

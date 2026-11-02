@@ -44,6 +44,7 @@ PAY_ENABLED = bool(ADMIN_ID and PAY_ACCOUNT and PAY_PRICE)
 # Automatic verification needs the OCR key. PAY_AUTO=0 forces manual approval by the admin.
 PAY_AUTO = os.environ.get("PAY_AUTO", "1") != "0" and bool(tools.OCR_API_KEY)
 PAY_MAX_TRIES = 3
+PAY_MAX_AGE_HOURS = _int_env("PAY_MAX_AGE_HOURS", 48)  # reject older receipts; 0 = off
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("student_bot")
@@ -697,12 +698,15 @@ async def pay_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text(tr(lg, "pay_checking"))
     ok, reason = False, "why_ocr"
     try:
+        if not ud.get("dir"):
+            ud["dir"] = tempfile.mkdtemp(prefix="stbot_")
         path = Path(ud["dir"]) / "receipt.jpg"
         tgfile = await photo.get_file()
         await tgfile.download_to_drive(str(path))
         text = await asyncio.to_thread(tools.ocr_text, path, ("ara", "eng"))
         if text.strip():
-            ok, reason = tools.check_receipt(text, p["txn"], p["amount"], PAY_ACCOUNT, PAY_NAME)
+            ok, reason = tools.check_receipt(text, p["txn"], p["amount"], PAY_ACCOUNT, PAY_NAME,
+                                             PAY_MAX_AGE_HOURS)
     except Exception:
         log.exception("receipt check failed")
     finally:

@@ -879,8 +879,31 @@ def _alnum(s):
     return re.sub(r"[^0-9a-z]", "", (s or "").translate(DIGITS).lower())
 
 
-def check_receipt(text, txn, amount, account, name):
-    """Returns (ok, reason_key). reason_key in why_txn / why_amount / why_recipient."""
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _receipt_datetime(t):
+    """First date found in the receipt text (e.g. 26-Oct-2026 19:41:15 or 2026-10-26 19:41), else None."""
+    hh = mm = 0
+    m = re.search(r"(\d{1,2})[-/ ]([A-Za-z]{3})[A-Za-z]*[-/ ](\d{4})(?:\D{0,3}(\d{1,2}):(\d{2}))?", t)
+    if m and m.group(2).lower() in _MONTHS:
+        d, mon, y = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
+        hh, mm = int(m.group(4) or 0), int(m.group(5) or 0)
+    else:
+        m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:\D{0,3}(\d{1,2}):(\d{2}))?", t)
+        if not m:
+            return None
+        y, mon, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hh, mm = int(m.group(4) or 0), int(m.group(5) or 0)
+    try:
+        return datetime(y, mon, d, hh, mm, tzinfo=TZ)
+    except ValueError:
+        return None
+
+
+def check_receipt(text, txn, amount, account, name, max_age_hours=0):
+    """Returns (ok, reason_key). reason_key in why_txn / why_amount / why_old / why_recipient."""
     t = (text or "").translate(DIGITS)
     if _alnum(txn) not in _alnum(t):
         return False, "why_txn"
@@ -895,6 +918,12 @@ def check_receipt(text, txn, amount, account, name):
             continue
     if not found_amount:
         return False, "why_amount"
+    if max_age_hours:
+        dt = _receipt_datetime(t)
+        if dt is not None:
+            now = datetime.now(TZ)
+            if dt < now - timedelta(hours=max_age_hours) or dt > now + timedelta(days=1):
+                return False, "why_old"
     acc = re.sub(r"\D", "", account or "")
     name_tokens = [w for w in re.split(r"\s+", (name or "").strip()) if len(w) >= 3]
     if acc or name_tokens:
