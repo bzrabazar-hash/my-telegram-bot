@@ -59,6 +59,12 @@ OWNER_CODE = os.environ.get("OWNER_CODE", "").strip()
 # Cancel code: /unvip CODE [USER_ID] removes unlimited use (yours, or the given user id).
 CANCEL_CODE = os.environ.get("CANCEL_CODE", "").strip()
 
+# Invites: a friend who joins by your link and uses one tool gives you REF_BONUS extra uses (max REF_MAX friends).
+REF_BONUS = _int_env("REF_BONUS", 2)
+REF_MAX = _int_env("REF_MAX", 20)
+# The bot sends the admin a copy of the database every BACKUP_HOURS hours (0 = off).
+BACKUP_HOURS = _int_env("BACKUP_HOURS", 24)
+
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("student_bot")
 
@@ -70,6 +76,8 @@ def _db(sql, args=(), mode=None):
         con.commit()
         if mode == "one":
             return cur.fetchone()
+        if mode == "all":
+            return cur.fetchall()
         if mode == "id":
             return cur.lastrowid
         return None
@@ -87,6 +95,13 @@ def init_db():
         _db("ALTER TABLE payments ADD COLUMN method TEXT")
     except sqlite3.OperationalError:
         pass
+    _db("CREATE TABLE IF NOT EXISTS events (day TEXT, tool TEXT, n INTEGER, PRIMARY KEY(day, tool))")
+    for col in ("joined INTEGER", "last_seen INTEGER", "referrer INTEGER", "ref_paid INTEGER DEFAULT 0",
+                "bonus INTEGER DEFAULT 0"):
+        try:
+            _db(f"ALTER TABLE users ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
 
 
 _lang_cache = {}
@@ -103,7 +118,8 @@ def get_lang(uid):
 
 
 def set_lang(uid, lang):
-    _db("INSERT OR REPLACE INTO users(user_id, lang) VALUES(?,?)", (uid, lang))
+    _db("INSERT INTO users(user_id, lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+        (uid, lang))
     _lang_cache[uid] = lang
 
 
@@ -120,9 +136,23 @@ def used_today(uid):
     return r[0] if r else 0
 
 
+def get_bonus(uid):
+    r = _db("SELECT bonus FROM users WHERE user_id=?", (uid,), "one")
+    return (r[0] or 0) if r else 0
+
+
 def add_use(uid):
-    _db("INSERT INTO usage(user_id, day, n) VALUES(?,?,1) ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1",
-        (uid, today()))
+    # the daily free uses go first; the invite bonus is spent only after them
+    if used_today(uid) < DAILY_LIMIT or get_bonus(uid) <= 0:
+        _db("INSERT INTO usage(user_id, day, n) VALUES(?,?,1) ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1",
+            (uid, today()))
+    else:
+        _db("UPDATE users SET bonus = bonus - 1 WHERE user_id=? AND bonus > 0", (uid,))
+
+
+def log_tool(key):
+    _db("INSERT INTO events(day, tool, n) VALUES(?,?,1) ON CONFLICT(day, tool) DO UPDATE SET n = n + 1",
+        (today(), key))
 
 
 def pass_until(uid):
@@ -135,7 +165,9 @@ def has_pass(uid):
 
 
 def remaining(uid):
-    return 10**6 if has_pass(uid) else max(0, DAILY_LIMIT - used_today(uid))
+    if has_pass(uid):
+        return 10**6
+    return max(0, DAILY_LIMIT - used_today(uid)) + get_bonus(uid)
 
 
 def fmt_ts(ts):
@@ -151,7 +183,11 @@ def grant_pass(user_id, hours):
 def quota_text(uid):
     if has_pass(uid):
         return tr(L(uid), "quota_pass", until=fmt_ts(pass_until(uid)))
-    return tr(L(uid), "quota_left", n=remaining(uid), limit=DAILY_LIMIT)
+    t = tr(L(uid), "quota_left", n=max(0, DAILY_LIMIT - used_today(uid)), limit=DAILY_LIMIT)
+    b = get_bonus(uid)
+    if b:
+        t += f"\n🎁 استخدامات إضافية من الدعوات: {b}"
+    return t
 
 
 # ───────────────────────── tools registry ─────────────────────────
@@ -224,6 +260,7 @@ def kb_home(uid):
             [B(tr(lg, "btn_quota"), "quota"), B(tr(lg, "btn_lang"), "lang:pick")]]
     if PAY_ENABLED:
         rows.append([B(tr(lg, "btn_pay"), "pay:start")])
+    rows.append([B("👥 دعوة الزملاء | Invite", "ref:info")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -259,6 +296,7 @@ def kb_limit(uid):
     rows = []
     if PAY_ENABLED:
         rows.append([B(tr(L(uid), "btn_pay_buy"), "pay:start")])
+    rows.append([B("👥 ادعُ زملاءك لاستخدامات إضافية | Invite", "ref:info")])
     rows.append([B(tr(L(uid), "btn_home"), "menu:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -331,6 +369,7 @@ async def execute(msg, uid, context, extra=None):
             await msg.reply_text("⚠️ " + tr(lg, "e_timer"))
             return
         minutes = int(nums[0])
+        log_tool(key)
         task = asyncio.create_task(run_timer(context.bot, msg.chat_id, minutes, lg))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
@@ -359,8 +398,11 @@ async def execute(msg, uid, context, extra=None):
         except Exception:
             pass
 
+    if ok:
+        log_tool(key)
     if ok and tool["counted"]:
         add_use(uid)
+        await reward_referrer(context.bot, uid)
     if ok:
         tail = f"\n{quota_text(uid)}" if tool["counted"] else ""
         if tool.get("keep"):
@@ -449,6 +491,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    reply_markup=kb_menu(uid, kind))
     elif data == "quota":
         await q.message.reply_text(quota_text(uid), reply_markup=kb_back(uid))
+    elif data == "ref:info":
+        await send_invite(q.message, uid, context.bot)
     elif data == "cancel":
         reset_state(context)
         await q.message.reply_text(tr(lg, "cancelled"), reply_markup=kb_home(uid))
@@ -867,6 +911,166 @@ async def unvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                              reply_markup=kb_home(uid))
 
 
+# ───────────────────────── users, invites, stats, backup ─────────────────────────
+_touch_cache = {}
+
+
+def touch_user_db(uid, ref=None):
+    now = int(time.time())
+    if _db("SELECT 1 FROM users WHERE user_id=?", (uid,), "one") is None:
+        if ref and (ref == uid or _db("SELECT 1 FROM users WHERE user_id=?", (ref,), "one") is None):
+            ref = None
+        _db("INSERT INTO users(user_id, joined, last_seen, referrer) VALUES(?,?,?,?)", (uid, now, now, ref))
+    else:
+        _db("UPDATE users SET last_seen=? WHERE user_id=?", (now, uid))
+
+
+async def touch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs first (group -2): records the user, the last visit, and who invited them. Never blocks."""
+    try:
+        u, chat = update.effective_user, update.effective_chat
+        if not u or not chat or chat.type != "private" or u.is_bot:
+            return
+        ref = None
+        m = update.message
+        if m and m.text and m.text.startswith("/start"):
+            parts = m.text.split()
+            if len(parts) > 1 and parts[1].startswith("ref_") and parts[1][4:].isdigit():
+                ref = int(parts[1][4:])
+        now = time.time()
+        if ref is None and now - _touch_cache.get(u.id, 0) < 60:
+            return
+        _touch_cache[u.id] = now
+        touch_user_db(u.id, ref)
+    except Exception:
+        log.exception("touch_user failed")
+
+
+async def reward_referrer(bot, uid):
+    """The invited student just used a tool for the first time: pay the inviter once."""
+    try:
+        r = _db("SELECT referrer FROM users WHERE user_id=? AND ref_paid=0 AND referrer IS NOT NULL", (uid,), "one")
+        if not r:
+            return
+        ref = r[0]
+        _db("UPDATE users SET ref_paid=1 WHERE user_id=?", (uid,))
+        done = (_db("SELECT COUNT(*) FROM users WHERE referrer=? AND ref_paid=1", (ref,), "one") or [0])[0]
+        if done > REF_MAX:
+            return
+        _db("UPDATE users SET bonus = COALESCE(bonus, 0) + ? WHERE user_id=?", (REF_BONUS, ref))
+        await bot.send_message(ref, f"🎉 زميل انضم عبر رابطك وجرّب البوت! أُضيف لك {REF_BONUS} استخدامات إضافية.\n"
+                                    f"🎁 Your invite worked: +{REF_BONUS} extra uses.")
+    except Exception:
+        log.exception("reward_referrer failed")
+
+
+async def send_invite(msg, uid, bot):
+    link = f"https://t.me/{bot.username}?start=ref_{uid}"
+    r = _db("SELECT COUNT(*), COALESCE(SUM(ref_paid), 0) FROM users WHERE referrer=?", (uid,), "one") or (0, 0)
+    await msg.reply_text(
+        "👥 ادعُ زملاءك واحصل على استخدامات إضافية!\n"
+        f"كل زميل ينضم عبر رابطك ويجرّب أداة واحدة = +{REF_BONUS} استخدامات لك (حتى {REF_MAX} زميلاً).\n\n"
+        f"رابطك:\n{link}\n\n"
+        f"📊 دعواتك الناجحة: {r[1]} | المنضمون: {r[0]} | رصيدك الحالي: {get_bonus(uid)}\n\n"
+        f"Invite friends: each friend who joins by your link and uses a tool gives you +{REF_BONUS} uses.",
+        reply_markup=kb_back(uid))
+
+
+async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_invite(update.message, update.effective_user.id, context.bot)
+
+
+def tool_label(k):
+    try:
+        return tr("ar", f"t_{k}")
+    except Exception:
+        return k
+
+
+def stats_text():
+    now = int(time.time())
+    midnight = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    week = now - 7 * 86400
+
+    def q1(sql, args=()):
+        r = _db(sql, args, "one")
+        return (r[0] or 0) if r else 0
+
+    since = (datetime.now(TZ) - timedelta(days=6)).strftime("%Y-%m-%d")
+    top = _db("SELECT tool, SUM(n) FROM events WHERE day>=? GROUP BY tool ORDER BY 2 DESC LIMIT 8", (since,), "all") or []
+    pay_ok = q1("SELECT COUNT(*) FROM payments WHERE status='approved'")
+    pay_wait = q1("SELECT COUNT(*) FROM payments WHERE status='pending'")
+    top_lines = "\n".join(f"  {i}. {tool_label(t)}: {n}" for i, (t, n) in enumerate(top, 1)) or "  —"
+    return (
+        "📊 إحصائيات البوت\n\n"
+        f"👥 المستخدمون المسجلون: {q1('SELECT COUNT(*) FROM users')}\n"
+        f"🆕 جدد اليوم: {q1('SELECT COUNT(*) FROM users WHERE joined>=?', (midnight,))}"
+        f" | هذا الأسبوع: {q1('SELECT COUNT(*) FROM users WHERE joined>=?', (week,))}\n"
+        f"🟢 نشطون اليوم: {q1('SELECT COUNT(*) FROM users WHERE last_seen>=?', (midnight,))}"
+        f" | هذا الأسبوع: {q1('SELECT COUNT(*) FROM users WHERE last_seen>=?', (week,))}\n\n"
+        f"🛠 استخدامات الأدوات اليوم: {q1('SELECT SUM(n) FROM events WHERE day=?', (today(),))}\n"
+        f"🏆 الأكثر استعمالاً (7 أيام):\n{top_lines}\n\n"
+        f"💳 اشتراكات فعالة الآن: {q1('SELECT COUNT(*) FROM passes WHERE until>?', (now,))}\n"
+        f"💰 مدفوعات مقبولة: {pay_ok}"
+        f" | بانتظار المراجعة: {pay_wait}\n\n"
+        f"🔗 الدعوات: {q1('SELECT COUNT(*) FROM users WHERE referrer IS NOT NULL')}"
+        f" | ناجحة: {q1('SELECT COUNT(*) FROM users WHERE ref_paid=1')}\n\n"
+        "ملاحظة: الأرقام الجديدة (النشاط والأدوات والدعوات) تبدأ من يوم تحديث البوت.")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(stats_text())
+
+
+async def send_backup(bot, chat_id, caption):
+    def _make():
+        d = Path(tempfile.mkdtemp(prefix="bk_"))
+        out = d / f"usage_{today()}.db"
+        src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(str(out))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        return out
+
+    path = await asyncio.to_thread(_make)
+    try:
+        with open(path, "rb") as f:
+            await bot.send_document(chat_id, f, filename=path.name, caption=caption)
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        await send_backup(context.bot, update.effective_chat.id, "🗄 نسخة احتياطية من قاعدة البيانات")
+    except Exception:
+        log.exception("backup failed")
+        await update.message.reply_text("⚠️ تعذّر إنشاء النسخة الاحتياطية.")
+
+
+async def backup_loop(bot):
+    await asyncio.sleep(3600)
+    while True:
+        try:
+            await send_backup(bot, ADMIN_ID, "🗄 نسخة احتياطية تلقائية")
+        except Exception:
+            log.exception("auto backup failed")
+        await asyncio.sleep(max(1, BACKUP_HOURS) * 3600)
+
+
+async def post_init(app):
+    if ADMIN_ID and BACKUP_HOURS > 0:
+        task = asyncio.create_task(backup_loop(app.bot))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error", exc_info=context.error)
 
@@ -876,7 +1080,8 @@ def main():
         raise SystemExit("Set the BOT_TOKEN environment variable")
     init_db()
     app = (Application.builder().token(TOKEN).concurrent_updates(True)
-           .connect_timeout(30).read_timeout(60).write_timeout(120).build())
+           .connect_timeout(30).read_timeout(60).write_timeout(120).post_init(post_init).build())
+    app.add_handler(TypeHandler(Update, touch_user), group=-2)  # record users first, never blocks
     app.add_handler(TypeHandler(Update, sub_gate), group=-1)  # forced channel join, checked first
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("quota", quota_cmd))
@@ -886,6 +1091,9 @@ def main():
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("unvip", unvip_cmd))
+    app.add_handler(CommandHandler("invite", invite_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
