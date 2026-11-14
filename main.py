@@ -2,6 +2,7 @@
 # Student Telegram bot v2. Settings come from environment variables (see README.txt).
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -13,8 +14,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram.constants import ChatMemberStatus
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, TypeHandler, filters)
 
 import tools
 from i18n import DEFAULT_LANG, LANGS, tr
@@ -45,6 +47,17 @@ PAY_ENABLED = bool(ADMIN_ID and PAY_ACCOUNT and PAY_PRICE)
 PAY_AUTO = os.environ.get("PAY_AUTO", "1") != "0" and bool(tools.OCR_API_KEY)
 PAY_MAX_TRIES = 3
 PAY_MAX_AGE_HOURS = _int_env("PAY_MAX_AGE_HOURS", 48)  # reject older receipts; 0 = off
+
+# Forced channel join. The bot must be an ADMIN of the channel. FORCE_CHANNEL=off disables it.
+FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL", "@Student_tools1").strip()
+if FORCE_CHANNEL.lower() in ("0", "off", "no", "none"):
+    FORCE_CHANNEL = ""
+FORCE_URL = os.environ.get("FORCE_URL", "https://t.me/Student_tools1").strip()
+
+# Owner code: /vip CODE gives unlimited use (10 years). Set OWNER_CODE in the host settings, not in GitHub.
+OWNER_CODE = os.environ.get("OWNER_CODE", "").strip()
+# Cancel code: /unvip CODE [USER_ID] removes unlimited use (yours, or the given user id).
+CANCEL_CODE = os.environ.get("CANCEL_CODE", "").strip()
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("student_bot")
@@ -743,6 +756,117 @@ async def pay_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify_admin_photo(context.bot, photo.file_id, cap, admin_kb(pid))
 
 
+# ───────────────────────── forced channel join ─────────────────────────
+_member_cache = {}  # user_id -> time of the last successful membership check
+_MEMBER_TTL = 120   # seconds a positive check is trusted (saves API calls)
+SUB_TEXT = ("🔒 للاستخدام يجب الانضمام إلى قناتنا أولاً، ثم اضغط «✅ تحققت».\n\n"
+            "🔒 Please join our channel first, then tap “✅ Done”.")
+
+
+def sub_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📢 انضم للقناة | Join", url=FORCE_URL)],
+                                 [B("✅ تحققت | Done", "sub:check")]])
+
+
+async def is_subscribed(bot, uid):
+    if not FORCE_CHANNEL:
+        return True
+    if time.time() - _member_cache.get(uid, 0) < _MEMBER_TTL:
+        return True
+    try:
+        m = await bot.get_chat_member(FORCE_CHANNEL, uid)
+    except Exception:
+        # Usually the bot is not an admin of the channel or the channel name is wrong.
+        # Do not lock every student out because of a setup mistake.
+        log.exception("membership check failed (is the bot an admin of %s ?)", FORCE_CHANNEL)
+        return True
+    ok = m.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) \
+        or (m.status == ChatMemberStatus.RESTRICTED and getattr(m, "is_member", False))
+    if ok:
+        _member_cache[uid] = time.time()
+    else:
+        _member_cache.pop(uid, None)
+    return ok
+
+
+async def sub_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler (group -1); blocks users who have not joined the channel."""
+    if not FORCE_CHANNEL:
+        return
+    user, chat = update.effective_user, update.effective_chat
+    if not user or not chat or chat.type != "private" or user.id == ADMIN_ID:
+        return
+    q = update.callback_query
+    if q and q.data == "sub:check":
+        if await is_subscribed(context.bot, user.id):
+            await q.answer("✅")
+            if get_lang(user.id) is None:
+                await q.message.reply_text(tr("ar", "choose_lang"), reply_markup=kb_langs())
+            else:
+                await send_welcome(q.message, user.id)
+        else:
+            await q.answer("❌ لم تنضم بعد | Not joined yet", show_alert=True)
+        raise ApplicationHandlerStop
+    if await is_subscribed(context.bot, user.id):
+        return
+    if q:
+        await q.answer("🔒 انضم للقناة أولاً | Join first", show_alert=True)
+        await q.message.reply_text(SUB_TEXT, reply_markup=sub_kb())
+    elif update.effective_message:
+        await update.effective_message.reply_text(SUB_TEXT, reply_markup=sub_kb())
+    raise ApplicationHandlerStop
+
+
+# ───────────────────────── owner code (unlimited use) ─────────────────────────
+_vip_fails = {}
+
+
+async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not OWNER_CODE or _vip_fails.get(uid, 0) >= 5:
+        return  # disabled, or too many wrong tries: stay silent
+    code = context.args[0] if context.args else ""
+    try:  # remove the message so the code does not stay in the chat
+        await update.message.delete()
+    except Exception:
+        pass
+    if code and hmac.compare_digest(code.encode("utf-8"), OWNER_CODE.encode("utf-8")):
+        _vip_fails.pop(uid, None)
+        grant_pass(uid, 24 * 365 * 10)
+        await update.effective_chat.send_message("✅ تم تفعيل الاستخدام بلا حدود لحسابك.\n✅ Unlimited use is on.",
+                                                 reply_markup=kb_home(uid))
+    else:
+        _vip_fails[uid] = _vip_fails.get(uid, 0) + 1
+        await update.effective_chat.send_message("❌ رمز غير صحيح | Wrong code")
+
+
+async def unvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not CANCEL_CODE or _vip_fails.get(uid, 0) >= 5:
+        return
+    code = context.args[0] if context.args else ""
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    if not (code and hmac.compare_digest(code.encode("utf-8"), CANCEL_CODE.encode("utf-8"))):
+        _vip_fails[uid] = _vip_fails.get(uid, 0) + 1
+        await update.effective_chat.send_message("❌ رمز غير صحيح | Wrong code")
+        return
+    _vip_fails.pop(uid, None)
+    target = uid
+    if len(context.args) > 1:
+        try:
+            target = int(context.args[1])
+        except ValueError:
+            await update.effective_chat.send_message("/unvip CODE [USER_ID]")
+            return
+    _db("DELETE FROM passes WHERE user_id=?", (target,))
+    who = "حسابك" if target == uid else f"الحساب {target}"
+    await update.effective_chat.send_message(f"🚫 تم إلغاء الاستخدام بلا حدود عن {who}.\n🚫 Unlimited use removed.",
+                                             reply_markup=kb_home(uid))
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error", exc_info=context.error)
 
@@ -753,17 +877,20 @@ def main():
     init_db()
     app = (Application.builder().token(TOKEN).concurrent_updates(True)
            .connect_timeout(30).read_timeout(60).write_timeout(120).build())
+    app.add_handler(TypeHandler(Update, sub_gate), group=-1)  # forced channel join, checked first
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("quota", quota_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("lang", lang_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("grant", grant_cmd))
+    app.add_handler(CommandHandler("vip", vip_cmd))
+    app.add_handler(CommandHandler("unvip", unvip_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    log.info("Bot started (payments=%s, auto-verify=%s)", PAY_ENABLED, PAY_AUTO)
+    log.info("Bot started (payments=%s, auto-verify=%s, force-channel=%s)", PAY_ENABLED, PAY_AUTO, FORCE_CHANNEL or "off")
     asyncio.set_event_loop(asyncio.new_event_loop())  # needed on Python 3.14
     app.run_polling()
 
